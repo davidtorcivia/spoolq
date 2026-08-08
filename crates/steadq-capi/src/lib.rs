@@ -47,7 +47,7 @@ fn error_to_code(e: &Error) -> c_int {
         Error::QueuePoisoned(_) => STEADQ_CORRUPTION,
         Error::NotCommitted(_) => STEADQ_NOT_COMMITTED,
         Error::IdentityCollision => STEADQ_NOT_COMMITTED,
-        Error::InvalidInput(_) => STEADQ_NOT_COMMITTED,
+        Error::InvalidInput(_) | Error::InvalidTicket(_) => STEADQ_NOT_COMMITTED,
     }
 }
 

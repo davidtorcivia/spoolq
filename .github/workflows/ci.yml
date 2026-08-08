@@ -78,7 +78,7 @@ jobs:
   # Mutation testing - diff-based, gating, parallelized by crate
   mutants:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

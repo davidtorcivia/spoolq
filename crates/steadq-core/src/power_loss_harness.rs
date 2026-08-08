@@ -263,8 +263,9 @@ impl PowerLossHarness {
         fs::fault::reset();
         match outcome {
             AckOutcome::OutcomeUnknown(t) => {
-                self.last_rename_src = Some(t.source_relative_path.clone());
-                self.last_rename_dest = Some(t.attempted_destination_relative_path.clone());
+                let (source, destination) = self.queue().transition_ticket_paths(&t).unwrap();
+                self.last_rename_src = Some(source);
+                self.last_rename_dest = Some(destination);
                 t
             }
             other => panic!("expected Ack OutcomeUnknown, got {other:?}"),
@@ -283,11 +284,10 @@ impl PowerLossHarness {
         fs::fault::reset();
         match outcome {
             TransitionOutcome::OutcomeUnknown(t) => {
-                self.last_rename_src = Some(t.source_relative_path.clone());
-                self.last_rename_dest = Some(t.attempted_destination_relative_path.clone());
-                self.saved_dest_bytes =
-                    std::fs::read(self.tmp.path().join(&t.attempted_destination_relative_path))
-                        .ok();
+                let (source, destination) = self.queue().transition_ticket_paths(&t).unwrap();
+                self.last_rename_src = Some(source);
+                self.last_rename_dest = Some(destination.clone());
+                self.saved_dest_bytes = std::fs::read(self.tmp.path().join(destination)).ok();
                 t
             }
             other => panic!("expected Retry OutcomeUnknown, got {other:?}"),
@@ -373,11 +373,9 @@ impl PowerLossHarness {
     /// Force a specific observation for resolve testing by directly manipulating
     /// the filesystem to contain source/dest/both/neither/conflict for the ticket.
     pub fn force_observation(&self, ticket: &TransitionTicket, obs: Observation) {
-        let src_path = self.tmp.path().join(&ticket.source_relative_path);
-        let dest_path = self
-            .tmp
-            .path()
-            .join(&ticket.attempted_destination_relative_path);
+        let (source, destination) = self.queue().transition_ticket_paths(ticket).unwrap();
+        let src_path = self.tmp.path().join(&source);
+        let dest_path = self.tmp.path().join(&destination);
         match obs {
             Observation::SourceOnly => {
                 let _ = std::fs::remove_file(&dest_path);
@@ -467,23 +465,14 @@ impl PowerLossHarness {
             ExpectedResolve::ConflictingObject => ResolutionOutcome::ConflictingObject,
         };
         if outcome != expected {
-            eprintln!(
-                "ticket src: {}, dest: {}",
-                ticket.source_relative_path, ticket.attempted_destination_relative_path
-            );
+            let (source, destination) = self.queue().transition_ticket_paths(ticket).unwrap();
+            eprintln!("ticket src: {}, dest: {}", source, destination);
             eprintln!(
                 "src exists: {}, dest exists: {}",
-                self.tmp.path().join(&ticket.source_relative_path).exists(),
-                self.tmp
-                    .path()
-                    .join(&ticket.attempted_destination_relative_path)
-                    .exists()
+                self.tmp.path().join(&source).exists(),
+                self.tmp.path().join(&destination).exists()
             );
-            if let Ok(bytes) = std::fs::read(
-                self.tmp
-                    .path()
-                    .join(&ticket.attempted_destination_relative_path),
-            ) {
+            if let Ok(bytes) = std::fs::read(self.tmp.path().join(&destination)) {
                 eprintln!(
                     "dest size: {}, first 32 bytes: {:02x?}",
                     bytes.len(),
@@ -492,7 +481,8 @@ impl PowerLossHarness {
             }
             eprintln!(
                 "ticket job_id: {:02x?}, token: {:?}",
-                ticket.job_id, ticket.lease_token
+                ticket.job_id(),
+                ticket.lease_token()
             );
         }
         assert_eq!(
@@ -567,7 +557,7 @@ mod tests {
                 "unexpected {outcome:?}"
             );
         }
-        assert_eq!(ticket.job_id, id);
+        assert_eq!(ticket.job_id(), id);
     }
 
     #[test]
@@ -604,7 +594,7 @@ mod tests {
         let lease = h.lease_one();
         let ticket = h.retry_outcome_unknown(&lease);
         // Ticket should match the leased job, not necessarily the last enqueued id if queue had other jobs.
-        assert_eq!(ticket.job_id, lease.job_id);
+        assert_eq!(ticket.job_id(), lease.job_id);
         h.crash(CrashWindow::AfterDestSyncBeforeSrcSync);
         // After retry crash, dest should be ready; verify it resolves to dest or source and queue remains usable.
         h.force_observation(&ticket, Observation::DestOnly);

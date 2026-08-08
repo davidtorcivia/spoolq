@@ -331,7 +331,7 @@ fn main() -> ExitCode {
                 }
                 LeaseOutcome::OutcomeUnknown(ticket) => {
                     eprintln!("outcome unknown");
-                    eprintln!("job_id: {}", steadq_names::hex_encode(&ticket.job_id));
+                    eprintln!("job_id: {}", steadq_names::hex_encode(&ticket.job_id()));
                     // P1-19: Persist ticket for later resolution.
                     if let Some(ref tf) = ticket_out {
                         match write_ticket_file(tf, &ticket) {
@@ -849,147 +849,26 @@ fn main() -> ExitCode {
                     return ExitCode::from(EXIT_ORDINARY);
                 }
             };
-            // P1-20: Strict ticket parsing. All identity fields must be
-            // present and valid. No silent defaults for security-critical fields.
-            let ticket_json: serde_json::Value = match serde_json::from_slice(&data) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("parse result file failed: {e}");
+            let ticket = match steadq_core::TransitionTicket::from_json(&data) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    eprintln!("invalid transition ticket: {error}");
                     return ExitCode::from(EXIT_ORDINARY);
                 }
             };
-            let get_str = |key: &str| -> Result<&str, &str> {
-                ticket_json
-                    .get(key)
-                    .and_then(|v| v.as_str())
-                    .ok_or("missing")
-            };
-            let get_u64_field = |key: &str| -> Result<u64, &str> {
-                ticket_json
-                    .get(key)
-                    .and_then(|v| v.as_u64())
-                    .ok_or("missing")
-            };
-
-            let job_id_hex = match get_str("job_id") {
-                Ok(v) => v.to_string(),
-                Err(_) => {
-                    eprintln!("missing field: job_id");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-            let job_id = match steadq_names::hex_decode_16(&job_id_hex) {
-                Some(id) => id,
-                None => {
-                    eprintln!("invalid job_id hex");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-            let source_path = match get_str("source_relative_path") {
-                Ok(v) => v.to_string(),
-                Err(_) => {
-                    eprintln!("missing field: source_relative_path");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-            let dest_path = match get_str("attempted_destination_relative_path") {
-                Ok(v) => v.to_string(),
-                Err(_) => {
-                    eprintln!("missing field: attempted_destination_relative_path");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-            let source_state = match get_str("source_state") {
-                Ok(v) => v.to_string(),
-                Err(_) => {
-                    eprintln!("missing field: source_state");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-            let dest_state = match get_str("attempted_destination_state") {
-                Ok(v) => v.to_string(),
-                Err(_) => {
-                    eprintln!("missing field: attempted_destination_state");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-            let source_generation = match get_u64_field("source_generation") {
-                Ok(v) => v,
-                Err(_) => {
-                    eprintln!("missing field: source_generation");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-            let source_attempt_raw = match get_u64_field("source_attempt") {
-                Ok(v) => v,
-                Err(_) => {
-                    eprintln!("missing field: source_attempt");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-            if source_attempt_raw > u32::MAX as u64 {
-                eprintln!("source_attempt exceeds u32 range");
-                return ExitCode::from(EXIT_ORDINARY);
-            }
-            let envelope_digest_hex = match get_str("envelope_digest") {
-                Ok(v) => v.to_string(),
-                Err(_) => {
-                    eprintln!("missing field: envelope_digest");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-            let envelope_digest = match steadq_names::hex_decode_32(&envelope_digest_hex) {
-                Some(d) => d,
-                None => {
-                    eprintln!("invalid envelope_digest hex");
-                    return ExitCode::from(EXIT_ORDINARY);
-                }
-            };
-
-            // lease_token is optional but must be valid if present
-            let lease_token = ticket_json
-                .get("lease_token")
-                .and_then(|v| v.as_str())
-                .and_then(|s| {
-                    if s.len() == 32 {
-                        steadq_names::hex_decode_16(s)
-                    } else {
-                        None
-                    }
-                });
-            // If lease_token field exists but is malformed, reject
-            if ticket_json.get("lease_token").is_some()
-                && ticket_json
-                    .get("lease_token")
-                    .and_then(|v| v.as_str())
-                    .is_some()
-                && lease_token.is_none()
-            {
-                eprintln!("invalid lease_token hex in ticket");
-                return ExitCode::from(EXIT_ORDINARY);
-            }
-
-            let ticket = steadq_core::TransitionTicket {
-                job_id,
-                source_state,
-                source_generation,
-                source_attempt: source_attempt_raw as u32,
-                source_relative_path: source_path.clone(),
-                attempted_destination_state: dest_state,
-                attempted_destination_relative_path: dest_path.clone(),
-                lease_token,
-                envelope_digest,
-            };
-            if let Err(error) = ticket.validate_paths() {
-                eprintln!("invalid transition ticket: {error}");
-                return ExitCode::from(EXIT_ORDINARY);
-            }
 
             let queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
                     return ExitCode::from(EXIT_IO_FAILURE);
+                }
+            };
+            let (source_path, dest_path) = match queue.transition_ticket_paths(&ticket) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    eprintln!("invalid transition ticket: {error}");
+                    return ExitCode::from(EXIT_ORDINARY);
                 }
             };
 
@@ -1385,26 +1264,14 @@ fn write_ticket_file(
     path: &std::path::Path,
     ticket: &steadq_core::TransitionTicket,
 ) -> std::io::Result<()> {
-    let json = format!(
-        r#"{{"job_id":"{}","source_state":"{}","source_generation":{},"source_attempt":{},"source_relative_path":"{}","attempted_destination_state":"{}","attempted_destination_relative_path":"{}","lease_token":{},"envelope_digest":"{}"}}"#,
-        steadq_names::hex_encode(&ticket.job_id),
-        ticket.source_state,
-        ticket.source_generation,
-        ticket.source_attempt,
-        ticket.source_relative_path,
-        ticket.attempted_destination_state,
-        ticket.attempted_destination_relative_path,
-        match ticket.lease_token {
-            Some(t) => format!(r#""{}""#, steadq_names::hex_encode(&t)),
-            None => "null".to_string(),
-        },
-        steadq_names::hex_encode(&ticket.envelope_digest),
-    );
+    let json = ticket
+        .to_json()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     let rand_bytes = steadq_fs_linux::random_128bit()
         .map(|b| steadq_names::hex_encode(&b))
         .unwrap_or_else(|_| format!("{}", std::process::id()));
     let tmp_path = path.with_extension(format!("tmp.{rand_bytes}"));
-    std::fs::write(&tmp_path, &json)?;
+    std::fs::write(&tmp_path, json)?;
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }

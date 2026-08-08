@@ -13,6 +13,8 @@ pub enum Error {
     IdentityCollision,
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("invalid transition ticket: {0}")]
+    InvalidTicket(String),
     #[error("unsupported filesystem")]
     UnsupportedFilesystem,
     #[error("unsupported format")]
@@ -101,79 +103,399 @@ pub enum InitialState {
     Delayed,
 }
 
-/// Ticket for resolving an indeterminate transition.
+pub const TRANSITION_TICKET_SCHEMA: &str = "steadq-transition-ticket";
+pub const TRANSITION_TICKET_VERSION: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionOperation {
+    Claim,
+    Renew,
+    Acknowledge,
+    RetryNow,
+    RetryLater,
+    Bury,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionPhase {
+    Linearized,
+    DestinationDirectoryDurable,
+    SourceDirectoryDurable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TicketSource {
+    Ready {},
+    Leased {
+        boot_id: String,
+        boottime_deadline_ns: u64,
+        wall_deadline_ns: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TicketDestination {
+    Ready {},
+    Leased {
+        boot_id: String,
+        boottime_deadline_ns: u64,
+        wall_deadline_ns: u64,
+    },
+    Delayed {
+        not_before_ns: u64,
+    },
+    Receipt {
+        terminal_bucket: u64,
+    },
+    Dead {
+        terminal_bucket: u64,
+        reason: u16,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketEvidence {
+    pub(crate) envelope_digest: [u8; 32],
+    pub(crate) payload_length: u64,
+}
+
+impl TicketEvidence {
+    pub(crate) fn new(envelope_digest: [u8; 32], payload_length: u64) -> Self {
+        Self {
+            envelope_digest,
+            payload_length,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketIdentity {
+    job_id: [u8; 16],
+    generation: u64,
+    attempt: u32,
+    maximum_attempts: u32,
+    lease_token: [u8; 16],
+    evidence: TicketEvidence,
+}
+
+impl TicketIdentity {
+    pub(crate) fn new(
+        job_id: [u8; 16],
+        generation: u64,
+        attempt: u32,
+        maximum_attempts: u32,
+        lease_token: [u8; 16],
+        evidence: TicketEvidence,
+    ) -> Self {
+        Self {
+            job_id,
+            generation,
+            attempt,
+            maximum_attempts,
+            lease_token,
+            evidence,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionTicket {
-    pub job_id: [u8; 16],
-    pub source_state: String,
-    pub source_generation: u64,
-    pub source_attempt: u32,
-    pub source_relative_path: String,
-    pub attempted_destination_state: String,
-    pub attempted_destination_relative_path: String,
-    pub lease_token: Option<[u8; 16]>,
-    pub envelope_digest: [u8; 32],
+    queue_id: [u8; 16],
+    operation: TransitionOperation,
+    phase: TransitionPhase,
+    job_id: [u8; 16],
+    source_generation: u64,
+    source_attempt: u32,
+    maximum_attempts: u32,
+    lease_token: [u8; 16],
+    envelope_digest: [u8; 32],
+    payload_length: u64,
+    source: TicketSource,
+    destination: TicketDestination,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransitionTicketWire {
+    schema: String,
+    version: u16,
+    queue_id: String,
+    operation: TransitionOperation,
+    phase: TransitionPhase,
+    source_identity: TicketIdentityWire,
+    source: TicketSource,
+    destination_derivation: TicketDestination,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketIdentityWire {
+    job_id: String,
+    generation: u64,
+    attempt: u32,
+    maximum_attempts: u32,
+    lease_token: String,
+    envelope_digest: String,
+    payload_length: u64,
 }
 
 impl TransitionTicket {
-    /// Validate both serialized ticket paths before either is used for I/O.
-    pub fn validate_paths(&self) -> Result<(), Error> {
-        validate_transition_path(&self.source_state, &self.source_relative_path)
-            .map_err(|message| Error::InvalidInput(format!("invalid source path: {message}")))?;
-        validate_transition_path(
-            &self.attempted_destination_state,
-            &self.attempted_destination_relative_path,
+    pub(crate) fn new(
+        queue_id: [u8; 16],
+        operation: TransitionOperation,
+        phase: TransitionPhase,
+        identity: TicketIdentity,
+        source: TicketSource,
+        destination: TicketDestination,
+    ) -> Result<Self, Error> {
+        let ticket = Self {
+            queue_id,
+            operation,
+            phase,
+            job_id: identity.job_id,
+            source_generation: identity.generation,
+            source_attempt: identity.attempt,
+            maximum_attempts: identity.maximum_attempts,
+            lease_token: identity.lease_token,
+            envelope_digest: identity.evidence.envelope_digest,
+            payload_length: identity.evidence.payload_length,
+            source,
+            destination,
+        };
+        ticket.validate()?;
+        Ok(ticket)
+    }
+
+    pub fn from_json(data: &[u8]) -> Result<Self, Error> {
+        let wire: TransitionTicketWire = serde_json::from_slice(data)
+            .map_err(|error| Error::InvalidTicket(format!("invalid JSON: {error}")))?;
+        if wire.schema != TRANSITION_TICKET_SCHEMA {
+            return Err(Error::InvalidTicket("invalid schema".into()));
+        }
+        if wire.version != TRANSITION_TICKET_VERSION {
+            return Err(Error::InvalidTicket("unsupported version".into()));
+        }
+        let queue_id = steadq_names::hex_decode_16(&wire.queue_id)
+            .ok_or_else(|| Error::InvalidTicket("invalid queue_id".into()))?;
+        let job_id = steadq_names::hex_decode_16(&wire.source_identity.job_id)
+            .ok_or_else(|| Error::InvalidTicket("invalid job_id".into()))?;
+        let lease_token = steadq_names::hex_decode_16(&wire.source_identity.lease_token)
+            .ok_or_else(|| Error::InvalidTicket("invalid lease_token".into()))?;
+        let envelope_digest = steadq_names::hex_decode_32(&wire.source_identity.envelope_digest)
+            .ok_or_else(|| Error::InvalidTicket("invalid envelope_digest".into()))?;
+        Self::new(
+            queue_id,
+            wire.operation,
+            wire.phase,
+            TicketIdentity::new(
+                job_id,
+                wire.source_identity.generation,
+                wire.source_identity.attempt,
+                wire.source_identity.maximum_attempts,
+                lease_token,
+                TicketEvidence::new(envelope_digest, wire.source_identity.payload_length),
+            ),
+            wire.source,
+            wire.destination_derivation,
         )
-        .map_err(|message| Error::InvalidInput(format!("invalid destination path: {message}")))?;
+    }
+
+    pub fn to_json(&self) -> Result<Vec<u8>, Error> {
+        let wire = TransitionTicketWire {
+            schema: TRANSITION_TICKET_SCHEMA.into(),
+            version: TRANSITION_TICKET_VERSION,
+            queue_id: steadq_names::hex_encode(&self.queue_id),
+            operation: self.operation,
+            phase: self.phase,
+            source_identity: TicketIdentityWire {
+                job_id: steadq_names::hex_encode(&self.job_id),
+                generation: self.source_generation,
+                attempt: self.source_attempt,
+                maximum_attempts: self.maximum_attempts,
+                lease_token: steadq_names::hex_encode(&self.lease_token),
+                envelope_digest: steadq_names::hex_encode(&self.envelope_digest),
+                payload_length: self.payload_length,
+            },
+            source: self.source.clone(),
+            destination_derivation: self.destination.clone(),
+        };
+        serde_json::to_vec_pretty(&wire)
+            .map_err(|error| Error::InvalidTicket(format!("serialization failed: {error}")))
+    }
+
+    pub fn operation(&self) -> TransitionOperation {
+        self.operation
+    }
+
+    pub fn phase(&self) -> TransitionPhase {
+        self.phase
+    }
+
+    pub fn queue_id(&self) -> [u8; 16] {
+        self.queue_id
+    }
+
+    pub fn job_id(&self) -> [u8; 16] {
+        self.job_id
+    }
+
+    pub fn source_generation(&self) -> u64 {
+        self.source_generation
+    }
+
+    pub fn source_attempt(&self) -> u32 {
+        self.source_attempt
+    }
+
+    pub fn maximum_attempts(&self) -> u32 {
+        self.maximum_attempts
+    }
+
+    pub fn lease_token(&self) -> [u8; 16] {
+        self.lease_token
+    }
+
+    pub fn envelope_digest(&self) -> [u8; 32] {
+        self.envelope_digest
+    }
+
+    pub fn payload_length(&self) -> u64 {
+        self.payload_length
+    }
+
+    pub fn source(&self) -> &TicketSource {
+        &self.source
+    }
+
+    pub fn destination(&self) -> &TicketDestination {
+        &self.destination
+    }
+
+    pub(crate) fn with_phase(&self, phase: TransitionPhase) -> Self {
+        let mut ticket = self.clone();
+        ticket.phase = phase;
+        ticket
+    }
+
+    pub(crate) fn source_common(&self) -> steadq_names::CommonFields {
+        steadq_names::CommonFields {
+            job_id: self.job_id,
+            generation: self.source_generation,
+            attempt: self.source_attempt,
+            maximum_attempts: self.maximum_attempts,
+        }
+    }
+
+    pub(crate) fn destination_common(&self) -> Result<steadq_names::CommonFields, Error> {
+        let generation = self
+            .source_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidTicket("source generation cannot increment".into()))?;
+        let attempt = if self.operation == TransitionOperation::Claim {
+            self.source_attempt
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidTicket("source attempt cannot increment".into()))?
+        } else {
+            self.source_attempt
+        };
+        Ok(steadq_names::CommonFields {
+            job_id: self.job_id,
+            generation,
+            attempt,
+            maximum_attempts: self.maximum_attempts,
+        })
+    }
+
+    pub(crate) fn validate_for_queue(&self, queue_id: &[u8; 16]) -> Result<(), Error> {
+        self.validate()?;
+        if &self.queue_id != queue_id {
+            return Err(Error::InvalidTicket(
+                "ticket belongs to another queue".into(),
+            ));
+        }
         Ok(())
     }
-}
 
-fn validate_transition_path(state: &str, path: &str) -> Result<(), String> {
-    let validated =
-        steadq_fs_linux::ValidatedRelativePath::new(path).map_err(|error| error.to_string())?;
-    let parts = validated.components().collect::<Vec<_>>();
-    if parts.first().copied() != Some(state) {
-        return Err("declared state does not match path".into());
+    fn validate(&self) -> Result<(), Error> {
+        if self.maximum_attempts == 0 {
+            return Err(Error::InvalidTicket(
+                "ticket maximum_attempts must be nonzero".into(),
+            ));
+        }
+        if self.source_attempt > self.maximum_attempts {
+            return Err(Error::InvalidTicket(
+                "ticket attempt exceeds maximum_attempts".into(),
+            ));
+        }
+        self.destination_common()?;
+        let legal = match (&self.operation, &self.source, &self.destination) {
+            (
+                TransitionOperation::Claim,
+                TicketSource::Ready {},
+                TicketDestination::Leased { .. },
+            ) => self.source_attempt < self.maximum_attempts,
+            (
+                TransitionOperation::Renew,
+                TicketSource::Leased { .. },
+                TicketDestination::Leased { .. },
+            )
+            | (
+                TransitionOperation::Acknowledge,
+                TicketSource::Leased { .. },
+                TicketDestination::Receipt { .. },
+            )
+            | (
+                TransitionOperation::RetryNow,
+                TicketSource::Leased { .. },
+                TicketDestination::Ready {},
+            )
+            | (
+                TransitionOperation::RetryLater,
+                TicketSource::Leased { .. },
+                TicketDestination::Delayed { .. },
+            )
+            | (
+                TransitionOperation::Bury,
+                TicketSource::Leased { .. },
+                TicketDestination::Dead { .. },
+            ) => true,
+            _ => false,
+        };
+        if !legal {
+            return Err(Error::InvalidTicket(
+                "operation does not permit the ticket source and destination".into(),
+            ));
+        }
+        for boot_id in [self.source_boot_id(), self.destination_boot_id()]
+            .into_iter()
+            .flatten()
+        {
+            if steadq_names::boot_id_bytes(boot_id).is_none() {
+                return Err(Error::InvalidTicket(
+                    "ticket boot_id is not canonical".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
-    let valid_shape = match state {
-        "ready" => {
-            parts.len() == 3
-                && steadq_names::shard_from_hex(parts[1]).is_some()
-                && steadq_names::parse_ready(parts[2]).is_ok()
+    fn source_boot_id(&self) -> Option<&str> {
+        match &self.source {
+            TicketSource::Ready {} => None,
+            TicketSource::Leased { boot_id, .. } => Some(boot_id),
         }
-        "leased" => {
-            parts.len() == 5
-                && steadq_names::boot_id_bytes(parts[1]).is_some()
-                && steadq_names::bucket_from_hex(parts[2]).is_some()
-                && steadq_names::shard_from_hex(parts[3]).is_some()
-                && steadq_names::parse_leased(parts[4]).is_ok()
-        }
-        "delayed" => {
-            parts.len() == 4
-                && steadq_names::bucket_from_hex(parts[1]).is_some()
-                && steadq_names::shard_from_hex(parts[2]).is_some()
-                && steadq_names::parse_delayed(parts[3]).is_ok()
-        }
-        "receipts" => {
-            parts.len() == 4
-                && steadq_names::bucket_from_hex(parts[1]).is_some()
-                && steadq_names::shard_from_hex(parts[2]).is_some()
-                && steadq_names::parse_receipt(parts[3]).is_ok()
-        }
-        "dead" => {
-            parts.len() == 4
-                && steadq_names::bucket_from_hex(parts[1]).is_some()
-                && steadq_names::shard_from_hex(parts[2]).is_some()
-                && steadq_names::parse_dead(parts[3]).is_ok()
-        }
-        _ => false,
-    };
-    if !valid_shape {
-        return Err("path does not have the canonical state shape".into());
     }
-    Ok(())
+
+    fn destination_boot_id(&self) -> Option<&str> {
+        match &self.destination {
+            TicketDestination::Leased { boot_id, .. } => Some(boot_id),
+            _ => None,
+        }
+    }
 }
 
 /// Lease info returned from claim or renew.
@@ -293,59 +615,6 @@ pub struct Snapshot {
 mod tests {
     use super::*;
 
-    fn canonical_transition_paths() -> Vec<(&'static str, String)> {
-        let queue_id = [0; 16];
-        let common = steadq_names::CommonFields {
-            job_id: [1; 16],
-            generation: 0,
-            attempt: 1,
-            maximum_attempts: 3,
-        };
-        let boot = "00000000-0000-0000-0000-000000000000";
-        let bucket = "0000000000000000";
-        let shard = "0000";
-        let token = [2; 16];
-        vec![
-            (
-                "ready",
-                format!(
-                    "ready/{shard}/{}",
-                    steadq_names::make_ready_name(&queue_id, shard, &common)
-                ),
-            ),
-            (
-                "leased",
-                format!(
-                    "leased/{boot}/{bucket}/{shard}/{}",
-                    steadq_names::make_leased_name(
-                        &queue_id, boot, bucket, shard, &common, 1, 2, &token,
-                    )
-                ),
-            ),
-            (
-                "delayed",
-                format!(
-                    "delayed/{bucket}/{shard}/{}",
-                    steadq_names::make_delayed_name(&queue_id, bucket, shard, &common, 1)
-                ),
-            ),
-            (
-                "receipts",
-                format!(
-                    "receipts/{bucket}/{shard}/{}",
-                    steadq_names::make_receipt_name(&queue_id, bucket, shard, &common, &token)
-                ),
-            ),
-            (
-                "dead",
-                format!(
-                    "dead/{bucket}/{shard}/{}",
-                    steadq_names::make_dead_name(&queue_id, bucket, shard, &common, 1)
-                ),
-            ),
-        ]
-    }
-
     #[test]
     fn dead_reason_round_trip() {
         for code in [0x0000u16, 0x0001, 0x0002, 0x0003, 0x0004] {
@@ -389,78 +658,201 @@ mod tests {
     }
 
     fn valid_transition_ticket() -> TransitionTicket {
-        let paths = canonical_transition_paths();
-        TransitionTicket {
-            job_id: [1; 16],
-            source_state: "ready".into(),
-            source_generation: 0,
-            source_attempt: 0,
-            source_relative_path: paths[0].1.clone(),
-            attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: paths[1].1.clone(),
-            lease_token: Some([2; 16]),
-            envelope_digest: [3; 32],
-        }
+        TransitionTicket::new(
+            [5; 16],
+            TransitionOperation::Claim,
+            TransitionPhase::Linearized,
+            TicketIdentity::new([6; 16], 7, 2, 4, [8; 16], TicketEvidence::new([9; 32], 12)),
+            TicketSource::Ready {},
+            TicketDestination::Leased {
+                boot_id: "00000000-0000-0000-0000-000000000000".into(),
+                boottime_deadline_ns: 10,
+                wall_deadline_ns: 11,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
-    fn transition_path_state_shapes() {
-        let cases = canonical_transition_paths();
-        for (state, path) in cases {
-            assert_eq!(validate_transition_path(state, &path), Ok(()));
-        }
+    fn transition_ticket_json_round_trip() {
+        let ticket = valid_transition_ticket();
+        let encoded = ticket.to_json().unwrap();
+        let decoded = TransitionTicket::from_json(&encoded).unwrap();
+        assert_eq!(decoded, ticket);
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["schema"], TRANSITION_TICKET_SCHEMA);
+        assert_eq!(value["version"], TRANSITION_TICKET_VERSION);
+        assert!(value.get("source_relative_path").is_none());
+        assert!(value.get("attempted_destination_relative_path").is_none());
     }
 
     #[test]
-    fn transition_path_rejects_unsafe_or_noncanonical_shapes() {
-        let cases = [
-            ("ready", ""),
-            ("ready", "/ready/0000/missing.sqj"),
-            ("ready", "ready/../outside.sqj"),
-            ("ready", "ready//missing.sqj"),
-            ("ready", "ready/0000/missing.sqj/"),
-            ("ready", "ready/0000/extra/missing.sqj"),
-            ("ready", "delayed/0000000000000000/0000/missing.sqj"),
-            ("unknown", "unknown/0000/missing.sqj"),
-            (
-                "leased",
-                "leased/not-a-boot/0000000000000000/0000/missing.sqj",
-            ),
-            ("delayed", "delayed/not-a-bucket/0000/missing.sqj"),
-            ("dead", "dead/0000000000000000/not-a-shard/missing.sqj"),
-            ("ready", "ready/0000/missing.sqj"),
-            (
-                "leased",
-                "leased/00000000-0000-0000-0000-000000000000/0000000000000000/0000/missing.sqj",
-            ),
-            ("delayed", "delayed/0000000000000000/0000/missing.sqj"),
-            ("receipts", "receipts/0000000000000000/0000/missing.rct"),
-            ("dead", "dead/0000000000000000/0000/missing.sqj"),
-        ];
-        for (state, path) in cases {
-            assert!(
-                validate_transition_path(state, path).is_err(),
-                "accepted {state} path {path}"
-            );
-        }
-    }
-
-    #[test]
-    fn transition_ticket_validates_both_paths() {
-        let mut ticket = valid_transition_ticket();
-        assert_eq!(ticket.validate_paths(), Ok(()));
-
-        ticket.source_relative_path = "../outside.sqj".into();
+    fn transition_ticket_accessors_preserve_identity() {
+        let ticket = valid_transition_ticket();
+        assert_eq!(ticket.queue_id(), [5; 16]);
+        assert_eq!(ticket.operation(), TransitionOperation::Claim);
+        assert_eq!(ticket.phase(), TransitionPhase::Linearized);
+        assert_eq!(ticket.job_id(), [6; 16]);
+        assert_eq!(ticket.source_generation(), 7);
+        assert_eq!(ticket.source_attempt(), 2);
+        assert_eq!(ticket.maximum_attempts(), 4);
+        assert_eq!(ticket.lease_token(), [8; 16]);
+        assert_eq!(ticket.envelope_digest(), [9; 32]);
+        assert_eq!(ticket.payload_length(), 12);
+        assert!(matches!(ticket.source(), TicketSource::Ready {}));
         assert!(matches!(
-            ticket.validate_paths(),
-            Err(Error::InvalidInput(_))
+            ticket.destination(),
+            TicketDestination::Leased {
+                boottime_deadline_ns: 10,
+                wall_deadline_ns: 11,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn transition_ticket_json_rejects_unknown_fields_and_wrong_schema() {
+        let ticket = valid_transition_ticket();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&ticket.to_json().unwrap()).unwrap();
+        value["unexpected"] = serde_json::json!(true);
+        assert!(TransitionTicket::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        value.as_object_mut().unwrap().remove("unexpected");
+        value["source"]["relative_path"] = serde_json::json!("../../outside");
+        assert!(TransitionTicket::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        value["source"]
+            .as_object_mut()
+            .unwrap()
+            .remove("relative_path");
+        value["schema"] = serde_json::json!("another-schema");
+        assert!(TransitionTicket::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        value["schema"] = serde_json::json!(TRANSITION_TICKET_SCHEMA);
+        value["version"] = serde_json::json!(TRANSITION_TICKET_VERSION + 1);
+        assert!(TransitionTicket::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn transition_ticket_rejects_operation_identity_mismatches() {
+        let mut ticket = valid_transition_ticket();
+        ticket.destination = TicketDestination::Receipt { terminal_bucket: 0 };
+        assert!(ticket.validate().is_err());
 
         ticket = valid_transition_ticket();
-        ticket.attempted_destination_relative_path = "leased/../../outside.sqj".into();
-        assert!(matches!(
-            ticket.validate_paths(),
-            Err(Error::InvalidInput(_))
-        ));
+        ticket.maximum_attempts = 0;
+        assert!(ticket.validate().is_err());
+
+        ticket = valid_transition_ticket();
+        ticket.source_attempt = ticket.maximum_attempts;
+        assert!(ticket.validate().is_err());
+
+        ticket = valid_transition_ticket();
+        ticket.source_generation = u64::MAX;
+        assert!(matches!(ticket.validate(), Err(Error::InvalidTicket(_))));
+
+        ticket = valid_transition_ticket();
+        ticket.source = TicketSource::Leased {
+            boot_id: "not-a-boot-id".into(),
+            boottime_deadline_ns: 1,
+            wall_deadline_ns: 2,
+        };
+        ticket.operation = TransitionOperation::Renew;
+        assert!(ticket.validate().is_err());
+
+        ticket = valid_transition_ticket();
+        ticket.destination = TicketDestination::Leased {
+            boot_id: "not-a-boot-id".into(),
+            boottime_deadline_ns: 1,
+            wall_deadline_ns: 2,
+        };
+        assert!(ticket.validate().is_err());
+    }
+
+    #[test]
+    fn transition_ticket_operation_matrix() {
+        let boot_id = "00000000-0000-0000-0000-000000000000".to_string();
+        let leased_source = || TicketSource::Leased {
+            boot_id: boot_id.clone(),
+            boottime_deadline_ns: 10,
+            wall_deadline_ns: 20,
+        };
+        let cases = [
+            (
+                TransitionOperation::Claim,
+                TicketSource::Ready {},
+                TicketDestination::Leased {
+                    boot_id: boot_id.clone(),
+                    boottime_deadline_ns: 30,
+                    wall_deadline_ns: 40,
+                },
+            ),
+            (
+                TransitionOperation::Renew,
+                leased_source(),
+                TicketDestination::Leased {
+                    boot_id: boot_id.clone(),
+                    boottime_deadline_ns: 30,
+                    wall_deadline_ns: 40,
+                },
+            ),
+            (
+                TransitionOperation::Acknowledge,
+                leased_source(),
+                TicketDestination::Receipt { terminal_bucket: 5 },
+            ),
+            (
+                TransitionOperation::RetryNow,
+                leased_source(),
+                TicketDestination::Ready {},
+            ),
+            (
+                TransitionOperation::RetryLater,
+                leased_source(),
+                TicketDestination::Delayed { not_before_ns: 50 },
+            ),
+            (
+                TransitionOperation::Bury,
+                leased_source(),
+                TicketDestination::Dead {
+                    terminal_bucket: 5,
+                    reason: 3,
+                },
+            ),
+        ];
+
+        for (operation, source, destination) in cases {
+            assert!(TransitionTicket::new(
+                [1; 16],
+                operation,
+                TransitionPhase::Linearized,
+                TicketIdentity::new([2; 16], 7, 1, 3, [3; 16], TicketEvidence::new([4; 32], 5),),
+                source,
+                destination,
+            )
+            .is_ok());
+        }
+
+        let invalid_destinations = [
+            TicketDestination::Ready {},
+            TicketDestination::Delayed { not_before_ns: 50 },
+            TicketDestination::Receipt { terminal_bucket: 5 },
+            TicketDestination::Dead {
+                terminal_bucket: 5,
+                reason: 3,
+            },
+        ];
+        for destination in invalid_destinations {
+            assert!(TransitionTicket::new(
+                [1; 16],
+                TransitionOperation::Renew,
+                TransitionPhase::Linearized,
+                TicketIdentity::new([2; 16], 7, 1, 3, [3; 16], TicketEvidence::new([4; 32], 5),),
+                leased_source(),
+                destination,
+            )
+            .is_err());
+        }
     }
 }

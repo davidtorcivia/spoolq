@@ -8,7 +8,6 @@ exclude_re = [
     "receipt_is_authentic",
     "fsck_verify_name_tag",
     "verify_shard_placement",
-    "resolve_check_object",
     "delete_expired_receipts",
     "reap_expired_leases",
     "promote_delayed",

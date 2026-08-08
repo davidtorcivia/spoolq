@@ -146,12 +146,29 @@ impl<'a> Layout<'a> {
         wall_deadline_ns: u64,
         token: &[u8; 16],
     ) -> Result<Target, Error> {
+        self.leased_for_boot(
+            common,
+            self.boot_id,
+            boottime_deadline_ns,
+            wall_deadline_ns,
+            token,
+        )
+    }
+
+    pub fn leased_for_boot(
+        &self,
+        common: &CommonFields,
+        boot_id: &str,
+        boottime_deadline_ns: u64,
+        wall_deadline_ns: u64,
+        token: &[u8; 16],
+    ) -> Result<Target, Error> {
         let bucket = steadq_math::lease_bucket(boottime_deadline_ns, self.lease_bucket_width_ns)
             .unwrap_or(0);
         let shard = self.shard_for(&common.job_id);
         let filename = steadq_names::make_leased_name(
             self.queue_id,
-            self.boot_id,
+            boot_id,
             &bucket_hex(bucket),
             &shard_hex(shard),
             common,
@@ -161,7 +178,7 @@ impl<'a> Layout<'a> {
         );
         Ok(Target {
             location: Location::Leased {
-                boot_id: self.boot_id.to_string(),
+                boot_id: boot_id.to_string(),
                 bucket,
                 shard,
             },
@@ -177,6 +194,15 @@ impl<'a> Layout<'a> {
     ) -> Result<Target, Error> {
         let bucket =
             steadq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns).unwrap_or(0);
+        Ok(self.receipt_in_bucket(common, token, bucket))
+    }
+
+    pub fn receipt_in_bucket(
+        &self,
+        common: &CommonFields,
+        token: &[u8; 16],
+        bucket: u64,
+    ) -> Target {
         let shard = self.shard_for(&common.job_id);
         let filename = steadq_names::make_receipt_name(
             self.queue_id,
@@ -185,15 +211,19 @@ impl<'a> Layout<'a> {
             common,
             token,
         );
-        Ok(Target {
+        Target {
             location: Location::Receipt { bucket, shard },
             filename,
-        })
+        }
     }
 
     pub fn dead(&self, common: &CommonFields, reason: u16, wall_ns: u64) -> Result<Target, Error> {
         let bucket =
             steadq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns).unwrap_or(0);
+        Ok(self.dead_in_bucket(common, reason, bucket))
+    }
+
+    pub fn dead_in_bucket(&self, common: &CommonFields, reason: u16, bucket: u64) -> Target {
         let shard = self.shard_for(&common.job_id);
         let filename = steadq_names::make_dead_name(
             self.queue_id,
@@ -202,10 +232,10 @@ impl<'a> Layout<'a> {
             common,
             reason,
         );
-        Ok(Target {
+        Target {
             location: Location::Dead { bucket, shard },
             filename,
-        })
+        }
     }
 
     fn is_valid_leased_path_parts(len: usize, first: &str) -> bool {

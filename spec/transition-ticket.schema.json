@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://steadq.dev/schema/transition-ticket-v2.json",
+  "title": "SteadQ transition ticket v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "queue_id",
+    "operation",
+    "phase",
+    "source_identity",
+    "source",
+    "destination_derivation"
+  ],
+  "properties": {
+    "schema": { "const": "steadq-transition-ticket" },
+    "version": { "const": 2 },
+    "queue_id": { "$ref": "#/$defs/hex16" },
+    "operation": {
+      "enum": ["claim", "renew", "acknowledge", "retry_now", "retry_later", "bury"]
+    },
+    "phase": {
+      "enum": ["linearized", "destination_directory_durable", "source_directory_durable"]
+    },
+    "source_identity": { "$ref": "#/$defs/sourceIdentity" },
+    "source": { "$ref": "#/$defs/source" },
+    "destination_derivation": { "$ref": "#/$defs/destination" }
+  },
+  "$defs": {
+    "hex16": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "hex32": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "sourceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "generation",
+        "attempt",
+        "maximum_attempts",
+        "lease_token",
+        "envelope_digest",
+        "payload_length"
+      ],
+      "properties": {
+        "job_id": { "$ref": "#/$defs/hex16" },
+        "generation": { "$ref": "#/$defs/u64" },
+        "attempt": { "$ref": "#/$defs/u32" },
+        "maximum_attempts": { "$ref": "#/$defs/u32" },
+        "lease_token": { "$ref": "#/$defs/hex16" },
+        "envelope_digest": { "$ref": "#/$defs/hex32" },
+        "payload_length": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "readySource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": { "state": { "const": "ready" } }
+    },
+    "leasedLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "boot_id", "boottime_deadline_ns", "wall_deadline_ns"],
+      "properties": {
+        "state": { "const": "leased" },
+        "boot_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "boottime_deadline_ns": { "$ref": "#/$defs/u64" },
+        "wall_deadline_ns": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "source": {
+      "oneOf": [
+        { "$ref": "#/$defs/readySource" },
+        { "$ref": "#/$defs/leasedLocation" }
+      ]
+    },
+    "destination": {
+      "oneOf": [
+        { "$ref": "#/$defs/readySource" },
+        { "$ref": "#/$defs/leasedLocation" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "not_before_ns"],
+          "properties": {
+            "state": { "const": "delayed" },
+            "not_before_ns": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "terminal_bucket"],
+          "properties": {
+            "state": { "const": "receipt" },
+            "terminal_bucket": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "terminal_bucket", "reason"],
+          "properties": {
+            "state": { "const": "dead" },
+            "terminal_bucket": { "$ref": "#/$defs/u64" },
+            "reason": { "type": "integer", "minimum": 0, "maximum": 65535 }
+          }
+        }
+      ]
+    }
+  }
+}
